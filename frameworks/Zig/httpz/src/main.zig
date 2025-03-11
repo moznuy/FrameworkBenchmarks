@@ -14,26 +14,29 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{
         .thread_safe = true,
     }){};
+    defer _ = gpa.deinit();
 
     const allocator = gpa.allocator();
 
-    var pg_pool = try pool.initPool(allocator);
-    defer pg_pool.deinit();
+    const init_pool = try pool.init(allocator);
+    defer init_pool.deinit();
 
     var prng = std.rand.DefaultPrng.init(@as(u64, @bitCast(std.time.milliTimestamp())));
 
     var rand = prng.random();
 
     var global = endpoints.Global{
-        .pool = pg_pool,
+        .pool = init_pool.pool,
         .rand = &rand,
     };
 
     const args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
 
     const port: u16 = if (args.len > 1) try std.fmt.parseInt(u16, args[1], 0) else 3000;
 
-    const workers = @as(u16, @intCast(16 * cpu_count));
+    const workers = if (builtin.mode == .Debug) 1 else 2;
+    const threads = if (builtin.mode == .Debug) 2 else @as(u16, @intCast(2 * cpu_count));
 
     server = try httpz.ServerApp(*endpoints.Global).init(allocator, .{
         .port = port,
@@ -71,7 +74,7 @@ pub fn main() !void {
             // Number threads. If you're handlers are doing a lot of i/o, a higher
             // number might provide better throughput
             // (blocking mode: handled differently)
-            .count = 256,
+            .count = threads,
 
             // The maximum number of pending requests that the thread pool will accept
             // This applies back pressure to the above workers and ensures that, under load
@@ -133,7 +136,7 @@ pub fn main() !void {
     router.get("/db", endpoints.db);
     router.get("/fortunes", endpoints.fortune);
 
-    std.debug.print("Httpz using {d} workers listening at 0.0.0.0:{d}\n", .{ workers, port });
+    std.debug.print("Httpz using {d} workers {d} threads listening at 0.0.0.0:{d}\n", .{ workers, threads, port });
 
     try server.listen();
 }
