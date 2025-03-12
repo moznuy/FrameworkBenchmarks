@@ -25,20 +25,20 @@ const Fortune = struct {
 };
 
 pub fn plaintext(_: *Global, _: *httpz.Request, res: *httpz.Response) !void {
-    try setHeaders(res.arena, res);
+    try setHeaders(res);
 
     res.content_type = .TEXT;
     res.body = "Hello, World!";
 }
 
 pub fn json(_: *Global, _: *httpz.Request, res: *httpz.Response) !void {
-    try setHeaders(res.arena, res);
+    try setHeaders(res);
 
     try res.json(.{ .message = "Hello, World!" }, .{});
 }
 
 pub fn db(global: *Global, _: *httpz.Request, res: *httpz.Response) !void {
-    try setHeaders(res.arena, res);
+    try setHeaders(res);
 
     global.mutex.lock();
     const random_number = 1 + (global.rand.uintAtMostBiased(u32, 9999));
@@ -53,7 +53,7 @@ pub fn db(global: *Global, _: *httpz.Request, res: *httpz.Response) !void {
 }
 
 pub fn fortune(global: *Global, _: *httpz.Request, res: *httpz.Response) !void {
-    try setHeaders(res.arena, res);
+    try setHeaders(res);
 
     const fortunes_html = try getFortunesHtml(res.arena, global.pool);
 
@@ -73,20 +73,31 @@ fn getWorld(pool: *pg.Pool, random_number: u32) !World {
     return World{ .id = row.get(i32, 0), .randomNumber = row.get(i32, 1) };
 }
 
-fn setHeaders(allocator: std.mem.Allocator, res: *httpz.Response) !void {
+threadlocal var date_buff: [128]u8 = undefined;
+threadlocal var date_str: []u8 = undefined;
+threadlocal var prev_time: ?datetimez.datetime.Datetime = null;
+
+fn setHeaders(res: *httpz.Response) !void {
     res.header("Server", "Httpz");
 
-    const now = datetimez.datetime.Date.now();
-    const time = datetimez.datetime.Time.now();
+    const cur_time = datetimez.datetime.Datetime.now();
+    if (prev_time == null or cur_time.sub(prev_time.?).totalSeconds() >= 1) {
+        // Wed, 17 Apr 2013 12:00:00 GMT
+        // Return date in ISO format YYYY-MM-DD
+        const TB_DATE_FMT = "{s:0>3}, {d:0>2} {s:0>3} {d:0>4} {d:0>2}:{d:0>2}:{d:0>2} GMT";
+        date_str = try std.fmt.bufPrint(&date_buff, TB_DATE_FMT, .{
+            cur_time.date.weekdayName()[0..3],
+            cur_time.date.day,
+            cur_time.date.monthName()[0..3],
+            cur_time.date.year,
+            cur_time.time.hour,
+            cur_time.time.minute,
+            cur_time.time.second,
+        });
+        prev_time = cur_time;
+    }
 
-    // Wed, 17 Apr 2013 12:00:00 GMT
-    // Return date in ISO format YYYY-MM-DD
-    const TB_DATE_FMT = "{s:0>3}, {d:0>2} {s:0>3} {d:0>4} {d:0>2}:{d:0>2}:{d:0>2} GMT";
-    const now_str = try std.fmt.allocPrint(allocator, TB_DATE_FMT, .{ now.weekdayName()[0..3], now.day, now.monthName()[0..3], now.year, time.hour, time.minute, time.second });
-
-    //defer allocator.free(now_str);
-
-    res.header("Date", now_str);
+    res.header("Date", date_str);
 }
 
 fn getFortunesHtml(allocator: std.mem.Allocator, pool: *pg.Pool) ![]const u8 {
@@ -94,33 +105,14 @@ fn getFortunesHtml(allocator: std.mem.Allocator, pool: *pg.Pool) ![]const u8 {
     // TODO: get newer version where bug ix fixed
     // const comptime_template = comptime mustache.parseComptime(template, .{}, .{});
 
-    const raw = try mustache.allocRenderText(allocator, template, .{ .fortunes = fortunes });
-
-    // std.debug.print("mustache output {s}\n", .{raw});
-
-    // const html = try deescapeHtml(allocator, raw);
-
-    // std.debug.print("html output {s}\n", .{html});
-
-    return raw;
+    const html = try mustache.allocRenderText(allocator, template, .{ .fortunes = fortunes });
+    return html;
 }
 
 fn getFortunes(allocator: std.mem.Allocator, pool: *pg.Pool) ![]const Fortune {
     var conn = try pool.acquire();
     defer conn.release();
-    // var buff: [256]u8 = undefined;
 
-    // for (0..100) |i| {
-    //     const message = try std.fmt.bufPrint(&buff, "MESSAGE {} " ++ "A computer program does what you tell it to do" ** 3, .{i});
-    //     _ = try conn.exec("INSERT INTO Fortune(id, message) VALUES ($1, $2)", .{ i + 100, message });
-    // }
-
-    // const rows0 = try conn.queryOpts("SELECT id, message FROM Fortune", .{}, .{ .allocator = allocator });
-    // try rows0.drain();
-    // rows0.deinit();
-    // const rows1 = try conn.queryOpts("SELECT id, message FROM Fortune", .{}, .{ .allocator = allocator });
-    // try rows1.drain();
-    // rows1.deinit();
     var rows = try conn.queryOpts("SELECT id, message FROM Fortune", .{}, .{ .allocator = allocator });
     defer rows.deinit();
 
@@ -128,31 +120,13 @@ fn getFortunes(allocator: std.mem.Allocator, pool: *pg.Pool) ![]const Fortune {
     defer fortunes.deinit();
 
     while (try rows.next()) |row| {
-        // const current_fortune = Fortune{
-        //     .id = row.get(i32, 0),
-        //     // From the first example of the lib: row.get is only valid until the next call to next(), deinit() or drain()
-        //     // ^ Confirmed during testing: if you insert 100 rows then message becomes garbled because pool/connection/row reuses arena
-        //     // which was small enough not to notice before
-        //     // .message = row.get([]const u8, 1),
-
-        //     // We assume allocator is local request arena so can forget allocation
-        //     .message = row.to([]const u8, .{ .allocator = allocator }),
-        // };
-
-        // Assumes column order is the same as struct fields
-        // We assume allocator is local request arena so can forget allocation
         const current_fortune = try row.to(Fortune, .{ .allocator = allocator });
         try fortunes.append(current_fortune);
-        // for (fortunes.items) |_fortune| {
-        //     std.debug.print("{d} {*} {s}\n", .{ _fortune.id, _fortune.message.ptr, _fortune.message });
-        // }
-        // std.debug.print("\n", .{});
     }
 
     const zero_fortune = Fortune{ .id = 0, .message = "Additional fortune added at request time." };
     try fortunes.append(zero_fortune);
 
-    // We assume allocator is local request arena so can forget allocation
     const fortunes_slice = try fortunes.toOwnedSlice();
     std.mem.sort(Fortune, fortunes_slice, {}, cmpFortuneByMessage);
 
@@ -163,53 +137,53 @@ fn cmpFortuneByMessage(_: void, a: Fortune, b: Fortune) bool {
     return std.mem.order(u8, a.message, b.message).compare(std.math.CompareOperator.lt);
 }
 
-// fn deescapeHtml(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
-//     var output = std.ArrayList(u8).init(allocator);
-//     defer output.deinit();
+fn deescapeHtml(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
+    var output = std.ArrayList(u8).init(allocator);
+    defer output.deinit();
 
-//     var i: usize = 0;
-//     while (i < input.len) {
-//         if (std.mem.startsWith(u8, input[i..], "&#32;")) {
-//             try output.append(' ');
-//             i += 5;
-//         } else if (std.mem.startsWith(u8, input[i..], "&#34;")) {
-//             try output.append('"');
-//             i += 5;
-//         } else if (std.mem.startsWith(u8, input[i..], "&#38;")) {
-//             try output.append('&');
-//             i += 5;
-//         } else if (std.mem.startsWith(u8, input[i..], "&#39;")) {
-//             try output.append('\'');
-//             i += 5;
-//         } else if (std.mem.startsWith(u8, input[i..], "&#40;")) {
-//             try output.append('(');
-//             i += 5;
-//         } else if (std.mem.startsWith(u8, input[i..], "&#41;")) {
-//             try output.append(')');
-//             i += 5;
-//         } else if (std.mem.startsWith(u8, input[i..], "&#43;")) {
-//             try output.append('+');
-//             i += 5;
-//         } else if (std.mem.startsWith(u8, input[i..], "&#44;")) {
-//             try output.append(',');
-//             i += 5;
-//         } else if (std.mem.startsWith(u8, input[i..], "&#46;")) {
-//             try output.append('.');
-//             i += 5;
-//         } else if (std.mem.startsWith(u8, input[i..], "&#47;")) {
-//             try output.append('/');
-//             i += 5;
-//         } else if (std.mem.startsWith(u8, input[i..], "&#58;")) {
-//             try output.append(':');
-//             i += 5;
-//         } else if (std.mem.startsWith(u8, input[i..], "&#59;")) {
-//             try output.append(';');
-//             i += 5;
-//         } else {
-//             try output.append(input[i]);
-//             i += 1;
-//         }
-//     }
+    var i: usize = 0;
+    while (i < input.len) {
+        if (std.mem.startsWith(u8, input[i..], "&#32;")) {
+            try output.append(' ');
+            i += 5;
+        } else if (std.mem.startsWith(u8, input[i..], "&#34;")) {
+            try output.append('"');
+            i += 5;
+        } else if (std.mem.startsWith(u8, input[i..], "&#38;")) {
+            try output.append('&');
+            i += 5;
+        } else if (std.mem.startsWith(u8, input[i..], "&#39;")) {
+            try output.append('\'');
+            i += 5;
+        } else if (std.mem.startsWith(u8, input[i..], "&#40;")) {
+            try output.append('(');
+            i += 5;
+        } else if (std.mem.startsWith(u8, input[i..], "&#41;")) {
+            try output.append(')');
+            i += 5;
+        } else if (std.mem.startsWith(u8, input[i..], "&#43;")) {
+            try output.append('+');
+            i += 5;
+        } else if (std.mem.startsWith(u8, input[i..], "&#44;")) {
+            try output.append(',');
+            i += 5;
+        } else if (std.mem.startsWith(u8, input[i..], "&#46;")) {
+            try output.append('.');
+            i += 5;
+        } else if (std.mem.startsWith(u8, input[i..], "&#47;")) {
+            try output.append('/');
+            i += 5;
+        } else if (std.mem.startsWith(u8, input[i..], "&#58;")) {
+            try output.append(':');
+            i += 5;
+        } else if (std.mem.startsWith(u8, input[i..], "&#59;")) {
+            try output.append(';');
+            i += 5;
+        } else {
+            try output.append(input[i]);
+            i += 1;
+        }
+    }
 
-//     return output.toOwnedSlice();
-// }
+    return output.toOwnedSlice();
+}
